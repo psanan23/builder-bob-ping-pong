@@ -283,3 +283,85 @@ test('an ambiguous reply cannot approve; an explicit current-recap statement can
   await h.message('I approve this recap');
   assert.equal((await h.state()).stage, 'approved');
 });
+
+test('a confirmed new project replaces only unapproved working state and makes old approvals stale', async () => {
+  const h = harness({ questions: [], files: { notes: 'The balcony is sheltered.' } });
+  await h.message('Make a balcony reading corner');
+  await h.message('', { document: { file_id: 'notes', file_name: 'balcony-notes.txt', file_size: 26 } });
+  const oldId = (await h.state()).id;
+  await h.callback(`files_ready:${oldId}`);
+  const oldRecap = (await h.state()).recap;
+
+  await h.message('/new');
+  assert.equal((await h.state()).pendingNew, true);
+  assert.equal((await h.state()).recap.version, oldRecap.version);
+  assert.match(h.last().message, /replace the current working details/);
+  assert.match(h.last().message, /Earlier Telegram messages will remain/);
+  assert.equal(h.last().buttons[0][0].callback_data, `new_confirm:${oldId}`);
+
+  await h.callback(`approve:${oldId}:${oldRecap.version}:${oldRecap.hash}`);
+  assert.equal((await h.state()).approved, null);
+  assert.equal((await h.state()).pendingNew, true);
+  await h.message('I approve this recap');
+  assert.equal((await h.state()).approved, null);
+
+  await h.callback(`new_confirm:${oldId}`);
+  const fresh = await h.state();
+  assert.notEqual(fresh.id, oldId);
+  assert.equal(fresh.stage, 'awaiting_project');
+  assert.equal(fresh.project.name, '');
+  assert.deepEqual(fresh.sources, []);
+  assert.deepEqual(fresh.questions, []);
+  assert.deepEqual(fresh.recapHistory, []);
+  assert.equal(fresh.recap, null);
+  assert.equal(fresh.approved, null);
+
+  await h.callback(`approve:${oldId}:${oldRecap.version}:${oldRecap.hash}`);
+  assert.match(h.last().message, /older project view/);
+  await h.message('Plan my real project');
+  await h.callback(`no_files:${fresh.id}`);
+  assert.equal(h.ai.calls.ask.at(-1).project.name, 'Plan my real project');
+  assert.deepEqual(h.ai.calls.ask.at(-1).sources, []);
+});
+
+test('new-project confirmation survives a restart; keeping the current project preserves its recap', async () => {
+  const h = harness({ questions: [] });
+  await h.message('Make a balcony reading corner');
+  const id = (await h.state()).id;
+  await h.callback(`no_files:${id}`);
+  const recap = (await h.state()).recap;
+  await h.message('/new');
+
+  const returningTelegram = fakeTelegram();
+  const returningBot = new AlignmentBot({ store: h.store, telegram: returningTelegram, ai: fakeAI(), clock: () => CLOCK });
+  await returningBot.handleUpdate({ update_id: 1001, message: { chat: { id: CHAT }, text: '/start' } });
+  assert.match(returningTelegram.sent.at(-1).message, /Start a new project\?/);
+  await returningBot.handleUpdate({
+    update_id: 1002,
+    callback_query: { id: 'keep', data: `new_cancel:${id}`, message: { chat: { id: CHAT } } },
+  });
+  const kept = await h.state();
+  assert.equal(kept.pendingNew, false);
+  assert.equal(kept.id, id);
+  assert.deepEqual(kept.recap, recap);
+  assert.match(returningTelegram.sent.at(-1).message, /Recap — version 1/);
+  await h.callback(`approve:${id}:${recap.version}:${recap.hash}`);
+  assert.equal((await h.state()).stage, 'approved');
+});
+
+test('an approved direction cannot be replaced through the new-project command', async () => {
+  const h = harness({ questions: [] });
+  await h.message('Make a balcony reading corner');
+  const id = (await h.state()).id;
+  await h.callback(`no_files:${id}`);
+  const recap = (await h.state()).recap;
+  await h.callback(`approve:${id}:${recap.version}:${recap.hash}`);
+  const approved = (await h.state()).approved;
+
+  await h.message('/new');
+  assert.match(h.last().message, /keep that saved recap intact/);
+  assert.equal((await h.state()).pendingNew, false);
+  assert.deepEqual((await h.state()).approved, approved);
+  await h.message('/saved');
+  assert.equal(h.last().message, approved.message);
+});
