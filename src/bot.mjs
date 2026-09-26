@@ -1,0 +1,444 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { PDFDocument } from 'pdf-lib';
+import { escapeHtml } from './telegram.mjs';
+
+const MAX_FILES = 6;
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const RECAP_FIELDS = ['doneMeans', 'builderHelp', 'bonNeeds', 'firstTwoWeeks', 'assumptionsDependencies'];
+const LABELS = ['Done means', 'I can help by', 'You would need to', 'First two weeks', 'Assumptions and dependencies'];
+const SUPPORTED = new Set(['.txt', '.md', '.pdf', '.jpg', '.jpeg', '.png']);
+
+function extension(name) {
+  return String(name).toLowerCase().match(/\.[a-z0-9]+$/)?.[0] || '';
+}
+
+function mimeFor(name) {
+  return ({ '.txt': 'text/plain', '.md': 'text/markdown', '.pdf': 'application/pdf', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png' })[extension(name)];
+}
+
+function newState(now) {
+  return {
+    id: randomUUID().replaceAll('-', '').slice(0, 10),
+    stage: 'awaiting_project',
+    project: { name: '', description: '' },
+    sources: [],
+    questions: [],
+    recap: null,
+    recapHistory: [],
+    corrections: [],
+    approved: null,
+    metrics: { selectedAt: null, firstResultAt: null, finalAnswerAt: null, recapAt: null, approvalAt: null },
+    createdAt: now,
+  };
+}
+
+function safeName(name) {
+  return String(name || 'unnamed file').replace(/[\r\n<>]/g, ' ').slice(0, 120);
+}
+
+function short(text, limit = 500) {
+  const value = String(text || '').trim();
+  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
+function recapHash(recap) {
+  const values = Object.fromEntries(RECAP_FIELDS.map((field) => [field, recap[field]]));
+  return createHash('sha256').update(JSON.stringify(values)).digest('hex').slice(0, 14);
+}
+
+function recapText(state) {
+  const recap = state.recap;
+  const parts = [`<b>${escapeHtml(state.project.name)} · Recap — version ${recap.version}</b>`];
+  RECAP_FIELDS.forEach((field, index) => parts.push(`<b>${LABELS[index]}</b>\n${escapeHtml(recap[field])}`));
+  parts.push('Does this match your goal and approach? Approve this recap, or tell me what to change.');
+  return parts.join('\n\n');
+}
+
+function recapButtons(state) {
+  const { version, hash } = state.recap;
+  return [[
+    { text: 'Approve this recap', callback_data: `approve:${state.id}:${version}:${hash}` },
+    { text: 'Make a change', callback_data: `change:${state.id}:${version}` },
+  ]];
+}
+
+function intakeButtons(state) {
+  return [[
+    { text: 'Files ready', callback_data: `files_ready:${state.id}` },
+    { text: 'No files', callback_data: `no_files:${state.id}` },
+  ]];
+}
+
+function blockedButtons(state, index) {
+  return [[
+    { text: 'Retry reading', callback_data: `retry_file:${state.id}:${index}` },
+    { text: 'Remove this file', callback_data: `remove_file:${state.id}:${index}` },
+  ]];
+}
+
+function approvalText(text) {
+  return /^(?:i approve (?:this|the) recap|yes,? approve(?: this recap)?|(?:yes,? )?this (?:recap )?matches my (?:goal and )?approach)[.!]?$/i.test(text.trim());
+}
+
+function contextFor(state) {
+  const referenceDate = state.metrics.selectedAt
+    ? new Date(state.metrics.selectedAt).toLocaleDateString('en-CA', { timeZone: 'Asia/Singapore' })
+    : null;
+  return {
+    project: state.project,
+    referenceDate,
+    timezone: 'Asia/Singapore',
+    sources: state.sources.filter((source) => source.status === 'read').map(({ name, facts, summary }) => ({ name, facts, summary })),
+    questions: state.questions,
+    recap: (state.proposedRecap || state.recap) ? Object.fromEntries(RECAP_FIELDS.map((field) => [field, (state.proposedRecap || state.recap)[field]])) : null,
+    corrections: state.corrections,
+  };
+}
+
+export class AlignmentBot {
+  constructor({ store, telegram, ai, clock = () => new Date().toISOString() }) {
+    this.store = store;
+    this.telegram = telegram;
+    this.ai = ai;
+    this.clock = clock;
+  }
+
+  async handleUpdate(update) {
+    if (!Number.isSafeInteger(update?.update_id)) return;
+    if (!(await this.store.claimUpdate(update.update_id))) return;
+    const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
+    if (!chatId) {
+      await this.store.completeUpdate(update.update_id);
+      return;
+    }
+    const loaded = await this.store.load(chatId);
+    const context = { chatId, state: loaded.state ?? newState(this.clock()), revision: loaded.revision };
+    try {
+      if (!loaded.state) await this.save(context);
+      if (update.callback_query) await this.handleCallback(context, update.callback_query);
+      else if (update.message) await this.handleMessage(context, update.message);
+      await this.store.completeUpdate(update.update_id);
+    } catch (error) {
+      await this.store.releaseUpdate(update.update_id).catch(() => {});
+      await this.telegram.send(chatId, 'I couldn’t finish that step. Your information is still here. Please send /retry.').catch(() => {});
+      // Logs contain only the operation and error class, never project text, files, or secrets.
+      console.error('Alignment update failed:', error?.name || 'Error');
+    }
+  }
+
+  async save(context) {
+    context.revision = await this.store.save(context.chatId, context.state, context.revision);
+  }
+
+  async handleMessage(context, message) {
+    const text = String(message.text || message.caption || '').trim();
+    if (text === '/start') return this.start(context);
+    if (text === '/retry') return this.retry(context);
+    if (text === '/saved') return this.showSaved(context);
+    if (message.document || message.photo?.length) return this.receiveFile(context, message);
+    if (!text) return this.telegram.send(context.chatId, 'Send the project name or a file to continue.');
+    if (context.state.approved) return this.showSaved(context);
+
+    const stage = context.state.stage;
+    if (!context.state.project.name) {
+      const [name, ...description] = text.split('\n');
+      context.state.project.name = short(name, 120);
+      context.state.project.description = short(description.join('\n'), 1500);
+      context.state.metrics.selectedAt = this.clock();
+      context.state.stage = 'collecting';
+      await this.save(context);
+      return this.telegram.send(context.chatId,
+        `<b>Files received</b>\nProject: ${escapeHtml(context.state.project.name)}\nSend any files now, or add a short description. When finished, tap Files ready. If there are no files, tap No files.\n\nI can read TXT, MD, PDF, JPG, and PNG: up to 6 files, 10 MB each, and 20 pages per PDF. Supplied material is processed by the bot’s AI provider.`,
+        intakeButtons(context.state));
+    }
+    if (stage === 'collecting' || stage === 'awaiting_project' || stage === 'collecting_new_file') {
+      if (/^files ready$/i.test(text)) return this.finishFiles(context, false);
+      if (/^no files$/i.test(text)) return this.finishFiles(context, true);
+      context.state.project.description = short([context.state.project.description, text].filter(Boolean).join('\n'), 2500);
+      await this.save(context);
+      return this.telegram.send(context.chatId, 'Added that to your project notes. Send files if useful, then tap Files ready.', intakeButtons(context.state));
+    }
+    if (stage === 'questions') return this.receiveAnswers(context, text);
+    if (stage === 'recap') {
+      if (approvalText(text)) return this.approve(context, context.state.recap.version, context.state.recap.hash);
+      return this.discuss(context, text);
+    }
+    if (stage === 'blocked') return this.telegram.send(context.chatId, 'Please replace or remove the file I couldn’t read. Then tap Files ready.');
+    return this.telegram.send(context.chatId, 'I’m still working on that step. Send /retry if it seems stuck.');
+  }
+
+  async start(context) {
+    const state = context.state;
+    if (state.approved) return this.showSaved(context);
+    if (!state.project.name) return this.telegram.send(context.chatId,
+      'I’m Builder Bob. Send the Notion page name and any files for the task. We’ll agree the goal and approach, then save that direction for a later action plan.\n\nI can read TXT, MD, PDF, JPG, and PNG: up to 6 files, 10 MB each, and 20 pages per PDF. Supplied material is processed by the bot’s AI provider.');
+    if (state.stage === 'recap') return this.sendRecap(context, false);
+    if (state.stage === 'questions') return this.sendQuestions(context, true);
+    if (state.stage === 'blocked') return this.sendCoverage(context);
+    return this.telegram.send(context.chatId, `Project: ${escapeHtml(state.project.name)}\nYour information is saved. Send files or tap Files ready to continue.`, intakeButtons(state));
+  }
+
+  async receiveFile(context, message) {
+    const state = context.state;
+    if (state.approved) return this.telegram.send(context.chatId, 'The direction is already saved. Send /saved to see it again.');
+    const document = message.document;
+    const photo = message.photo?.at(-1);
+    const name = safeName(document?.file_name || `photo-${photo?.file_unique_id || Date.now()}.jpg`);
+    const size = document?.file_size ?? photo?.file_size ?? 0;
+    const fileId = document?.file_id || photo?.file_id;
+    let reason = '';
+    if (state.sources.filter((source) => source.status !== 'removed').length >= MAX_FILES) reason = 'This test accepts up to 6 files. Please remove this file from the project.';
+    else if (!SUPPORTED.has(extension(name))) reason = `Unsupported format ${extension(name) || '(none)'}. Please send TXT, MD, PDF, JPG, or PNG.`;
+    else if (size > MAX_FILE_BYTES) reason = 'The file is over 10 MB.';
+    const source = { name, fileId, mime: mimeFor(name), size, status: reason ? 'blocked' : 'pending', reason, facts: [], summary: '' };
+    state.sources.push(source);
+    state.stage = state.recap ? 'collecting_new_file' : 'collecting';
+    await this.save(context);
+    if (reason) return this.telegram.send(context.chatId,
+      `Couldn’t read: ${escapeHtml(name)} — ${escapeHtml(reason)}\nSend a readable replacement or remove this file before questions.`,
+      blockedButtons(state, state.sources.length - 1));
+    return this.telegram.send(context.chatId,
+      `Received: ${escapeHtml(name)}. I’ll read it when you tap Files ready.`, intakeButtons(state));
+  }
+
+  async handleCallback(context, query) {
+    await this.telegram.answerCallback(query.id).catch(() => {});
+    const [action, projectId, extra, hash] = String(query.data || '').split(':');
+    const state = context.state;
+    if (projectId !== state.id) return this.telegram.send(context.chatId, 'That control belongs to an older project view. Send /start for the current one.');
+    if (action === 'saved') return this.showSaved(context);
+    if (state.approved) return this.showSaved(context);
+    if (action === 'files_ready') return this.finishFiles(context, false);
+    if (action === 'no_files') return this.finishFiles(context, true);
+    if (action === 'retry_file') {
+      const source = state.sources[Number(extra)];
+      if (!source || source.status !== 'blocked' || !['blocked', 'collecting', 'collecting_new_file'].includes(state.stage)) {
+        return this.telegram.send(context.chatId, 'That file control is no longer current. Send /start to continue.');
+      }
+      source.status = 'pending'; source.reason = '';
+      state.stage = state.recap ? 'collecting_new_file' : 'collecting';
+      await this.save(context);
+      return this.finishFiles(context, false);
+    }
+    if (action === 'remove_file') {
+      const source = state.sources[Number(extra)];
+      if (!source || source.status !== 'blocked' || !['blocked', 'collecting', 'collecting_new_file'].includes(state.stage)) {
+        return this.telegram.send(context.chatId, 'That file control is no longer current. Send /start to continue.');
+      }
+      source.status = 'removed'; source.reason = 'Removed from this project at your request';
+      await this.save(context);
+      await this.telegram.send(context.chatId, `Removed: ${escapeHtml(source.name)}.`, intakeButtons(state));
+      return;
+    }
+    if (action === 'change') {
+      if (state.stage !== 'recap' || Number(extra) !== state.recap?.version) return this.outdated(context);
+      return this.telegram.send(context.chatId, 'What would you like me to change in this recap? A sentence is enough.');
+    }
+    if (action === 'approve') return this.approve(context, Number(extra), hash);
+  }
+
+  async finishFiles(context, noFiles) {
+    const state = context.state;
+    if (!state.project.name) return this.telegram.send(context.chatId, 'What is the Notion page called? I’ll keep the files you sent.');
+    if (!['collecting', 'collecting_new_file', 'blocked', 'inspecting'].includes(state.stage)) return this.telegram.send(context.chatId, 'That upload choice is from an older message. Send /start to see where we are.');
+    if (noFiles && state.sources.some((source) => source.status !== 'removed')) {
+      return this.telegram.send(context.chatId, 'You have already sent files. Tap Files ready so I can read them, or remove the files first.');
+    }
+    state.stage = 'inspecting';
+    await this.save(context);
+    await this.telegram.send(context.chatId, 'Reading your files now.');
+    for (const source of state.sources) {
+      if (source.status !== 'pending') continue;
+      try {
+        const buffer = await this.telegram.getFile(source.fileId, MAX_FILE_BYTES);
+        if (extension(source.name) === '.pdf') {
+          const pdf = await PDFDocument.load(buffer, { ignoreEncryption: false });
+          const pages = pdf.getPageCount();
+          if (pages > 20) throw new Error(`The PDF has ${pages} pages; this test accepts at most 20.`);
+        }
+        const result = await this.ai.inspectFile({ name: source.name, mime: source.mime, buffer });
+        if (!result?.readable) throw new Error(result?.reason || 'The content could not be read');
+        source.status = 'read';
+        source.facts = (result.facts || []).map((item) => short(item, 350)).slice(0, 12);
+        source.summary = short(result.summary, 500);
+        source.reason = '';
+      } catch (error) {
+        source.status = 'blocked';
+        source.reason = short(error.message || 'The file could not be read', 180);
+      }
+      await this.save(context);
+    }
+    if (!state.metrics.firstResultAt) state.metrics.firstResultAt = this.clock();
+    if (state.sources.some((source) => source.status === 'blocked')) state.stage = 'blocked';
+    else state.stage = 'inspection_done';
+    await this.save(context);
+    await this.sendCoverage(context);
+    if (state.stage === 'blocked') return;
+    if (state.recap) return this.buildRecap(context, 'I read new material supplied before approval.');
+    if (state.questions.length) {
+      state.stage = 'questions'; await this.save(context);
+      return this.sendQuestions(context, true);
+    }
+    return this.askQuestions(context);
+  }
+
+  async sendCoverage(context) {
+    const state = context.state;
+    const lines = state.sources.filter((source) => source.status !== 'removed').map((source) => {
+      if (source.status === 'read') return `Read: ${escapeHtml(source.name)}${source.summary ? ` — ${escapeHtml(short(source.summary, 180))}` : ''}`;
+      return `Couldn’t read: ${escapeHtml(source.name)} — ${escapeHtml(source.reason || 'Reading did not finish')}`;
+    });
+    await this.telegram.send(context.chatId, `<b>File coverage</b>\n${lines.length ? lines.join('\n') : 'No files supplied.'}`);
+    const index = state.sources.findIndex((source) => source.status === 'blocked');
+    if (index >= 0) await this.telegram.send(context.chatId,
+      `Please replace or remove ${escapeHtml(state.sources[index].name)} before I ask questions.`,
+      blockedButtons(state, index));
+  }
+
+  async askQuestions(context) {
+    const state = context.state;
+    state.stage = 'generating_questions'; await this.save(context);
+    let proposed;
+    try { proposed = await this.ai.askQuestions(contextFor(state)); }
+    catch { state.stage = 'inspection_done'; await this.save(context); return this.telegram.send(context.chatId, 'I couldn’t prepare the questions yet. Send /retry to try again.'); }
+    if (!Array.isArray(proposed) || proposed.length > 5 || proposed.some((q) => !q.question || !q.why || (q.question.match(/\?/g) || []).length > 1)) {
+      state.stage = 'inspection_done'; await this.save(context);
+      return this.telegram.send(context.chatId, 'I couldn’t make a short enough question list yet. Send /retry to try again.');
+    }
+    state.questions = proposed.map(({ question, why }) => ({ question: short(question, 280), why: short(why, 180), answer: '' }));
+    if (!state.questions.length) {
+      state.metrics.finalAnswerAt = this.clock();
+      state.stage = 'ready_for_recap'; await this.save(context);
+      return this.buildRecap(context);
+    }
+    state.stage = 'questions'; await this.save(context);
+    return this.sendQuestions(context, false);
+  }
+
+  async sendQuestions(context, remainingOnly) {
+    const questions = context.state.questions.map((q, index) => ({ ...q, index: index + 1 })).filter((q) => !remainingOnly || !q.answer);
+    if (!questions.length) return this.buildRecap(context);
+    const lines = questions.map((q) => `${q.index}. ${escapeHtml(q.question)}\nWhy: ${escapeHtml(q.why)}`);
+    return this.telegram.send(context.chatId,
+      `<b>A few questions</b>\n${lines.join('\n\n')}\n\nShort numbered replies are fine. If you don’t know an answer, say “unsure.”`);
+  }
+
+  async receiveAnswers(context, text) {
+    const state = context.state;
+    let parsed;
+    try { parsed = await this.ai.parseAnswers(contextFor(state), text); }
+    catch { return this.telegram.send(context.chatId, 'I couldn’t read that reply just now. Please send it again.'); }
+    let changed = false;
+    for (const item of parsed?.answers || []) {
+      const index = Number(item.index) - 1;
+      if (index >= 0 && index < state.questions.length && !state.questions[index].answer && String(item.answer || '').trim()) {
+        state.questions[index].answer = short(item.answer, 1200);
+        changed = true;
+      }
+    }
+    if (!changed) return this.telegram.send(context.chatId, escapeHtml(parsed?.followup || 'Please reply with the question number and your answer.'));
+    await this.save(context);
+    if (state.questions.some((q) => !q.answer)) return this.sendQuestions(context, true);
+    state.metrics.finalAnswerAt = this.clock();
+    state.stage = 'ready_for_recap'; await this.save(context);
+    return this.buildRecap(context);
+  }
+
+  async buildRecap(context, changeNote = '') {
+    const state = context.state;
+    state.stage = 'generating_recap'; await this.save(context);
+    let draft;
+    try { draft = await this.ai.makeRecap(contextFor(state)); }
+    catch { state.stage = 'ready_for_recap'; await this.save(context); return this.telegram.send(context.chatId, 'I couldn’t finish the recap yet. Send /retry to try again.'); }
+    if (RECAP_FIELDS.some((field) => !String(draft?.[field] || '').trim())) {
+      state.stage = 'ready_for_recap'; await this.save(context);
+      return this.telegram.send(context.chatId, 'The recap was incomplete. Send /retry to try again.');
+    }
+    const version = (state.recap?.version || 0) + 1;
+    const recap = Object.fromEntries(RECAP_FIELDS.map((field) => [field, short(
+      state.patchedFields?.includes(field) ? state.proposedRecap?.[field] : draft[field], 650)]));
+    recap.version = version;
+    recap.hash = recapHash(recap);
+    recap.createdAt = this.clock();
+    state.recap = recap;
+    state.proposedRecap = null;
+    state.patchedFields = null;
+    state.recapHistory.push(recap);
+    state.stage = 'recap';
+    state.metrics.recapAt = this.clock();
+    await this.save(context);
+    if (changeNote) await this.telegram.send(context.chatId, `Changed: ${escapeHtml(changeNote)}`);
+    return this.sendRecap(context, version === 1);
+  }
+
+  async sendRecap(context, first) {
+    const state = context.state;
+    const text = recapText(state);
+    if (text.length > 4000) throw new Error('Recap exceeds Telegram message limit');
+    await this.telegram.send(context.chatId, text, recapButtons(state));
+    if (first) await this.telegram.send(context.chatId,
+      'This approves the direction only. It does not authorize purchases, bookings, submissions, or messages to other people. The detailed action plan comes later.');
+  }
+
+  async discuss(context, text) {
+    const state = context.state;
+    state.stage = 'processing_discussion';
+    state.latestUserText = short(text, 3000);
+    await this.save(context);
+    let result;
+    try { result = await this.ai.handleDiscussion(contextFor(state), text); }
+    catch { state.stage = 'recap'; await this.save(context); return this.telegram.send(context.chatId, 'I couldn’t answer that just now. Please send it again.'); }
+    if (result.kind === 'question' || result.kind === 'clarification') {
+      state.stage = 'recap'; await this.save(context);
+      await this.telegram.send(context.chatId, escapeHtml(result.reply || 'Which part would you like to change?'));
+      return this.telegram.send(context.chatId, 'You can still approve the current recap, or tell me what to change.', recapButtons(state));
+    }
+    state.corrections.push({ text: short(text, 3000), at: this.clock() });
+    state.proposedRecap = { ...state.recap };
+    state.patchedFields = [];
+    if (result.patch && typeof result.patch === 'object') {
+      for (const field of RECAP_FIELDS) if (String(result.patch[field] || '').trim()) {
+        state.proposedRecap[field] = short(result.patch[field], 650);
+        state.patchedFields.push(field);
+      }
+    }
+    state.stage = 'ready_for_recap'; await this.save(context);
+    return this.buildRecap(context, short(result.changedNote || result.reply || 'I updated the direction you corrected.', 200));
+  }
+
+  async approve(context, version, hash) {
+    const state = context.state;
+    if (state.stage !== 'recap' || state.recap?.version !== version || state.recap?.hash !== hash) return this.outdated(context);
+    const snapshot = { project: { ...state.project }, recap: { ...state.recap }, message: recapText(state), approvedAt: this.clock(), chatId: context.chatId };
+    state.approved = snapshot;
+    state.stage = 'approved';
+    state.metrics.approvalAt = snapshot.approvedAt;
+    try { await this.save(context); }
+    catch { return this.telegram.send(context.chatId, 'I couldn’t save that yet. Your approval is still here; please retry saving by pressing Approve this recap again.'); }
+    return this.telegram.send(context.chatId,
+      `Direction saved — version ${version}. We’ll use this agreed goal and approach for a later action plan.`,
+      [[{ text: 'Show saved recap', callback_data: `saved:${state.id}` }]]);
+  }
+
+  async showSaved(context) {
+    const approved = context.state.approved;
+    if (!approved) return this.telegram.send(context.chatId, 'No direction has been saved yet. Send /start to continue.');
+    return this.telegram.send(context.chatId, approved.message,
+      [[{ text: 'Show saved recap', callback_data: `saved:${context.state.id}` }]]);
+  }
+
+  async outdated(context) {
+    await this.telegram.send(context.chatId, 'That approval is for an older recap. Please review the latest version.');
+    if (context.state.stage === 'recap') await this.sendRecap(context, false);
+  }
+
+  async retry(context) {
+    const stage = context.state.stage;
+    if (stage === 'approved') return this.showSaved(context);
+    if (stage === 'collecting' || stage === 'collecting_new_file' || stage === 'blocked' || stage === 'inspecting') return this.finishFiles(context, false);
+    if (stage === 'inspection_done' || stage === 'generating_questions') return this.askQuestions(context);
+    if (stage === 'ready_for_recap' || stage === 'generating_recap') return this.buildRecap(context);
+    if (stage === 'processing_discussion' && context.state.latestUserText) return this.discuss(context, context.state.latestUserText);
+    return this.start(context);
+  }
+}
