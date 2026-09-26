@@ -141,7 +141,11 @@ export class AlignmentBot {
   async handleMessage(context, message) {
     const text = String(message.text || message.caption || '').trim();
     if (text === '/new') return this.beginNew(context);
-    if (context.state.pendingNew) return this.newProjectPrompt(context);
+    if (context.state.pendingNew) {
+      if (text === 'Start new project') return this.confirmNew(context);
+      if (text === 'Keep current project') return this.cancelNew(context);
+      return this.newProjectPrompt(context);
+    }
     if (text === '/start') return this.start(context);
     if (text === '/retry') return this.retry(context);
     if (text === '/saved') return this.showSaved(context);
@@ -202,8 +206,26 @@ export class AlignmentBot {
 
   async newProjectPrompt(context) {
     return this.telegram.send(context.chatId,
-      `Start a new project? This will replace the current working details for ${escapeHtml(context.state.project.name)} in the bot, including file notes, answers, and recap. Earlier Telegram messages will remain in this chat, but I will not use them for the new project.`,
+      `Start a new project? This will replace the current working details for ${escapeHtml(context.state.project.name)} in the bot, including file notes, answers, and recap. Earlier Telegram messages will remain in this chat, but I will not use them for the new project.\n\nTap a button, or reply exactly Start new project or Keep current project.`,
       newProjectButtons(context.state));
+  }
+
+  async cancelNew(context) {
+    const state = context.state;
+    if (!state.pendingNew) return this.telegram.send(context.chatId, 'That choice is no longer current. Send /start to continue.');
+    state.pendingNew = false;
+    await this.save(context);
+    await this.telegram.send(context.chatId, `Keeping ${escapeHtml(state.project.name)}.`);
+    return this.start(context);
+  }
+
+  async confirmNew(context) {
+    const state = context.state;
+    if (!state.pendingNew || state.approved) return this.telegram.send(context.chatId, 'That choice is no longer current. Send /start to continue.');
+    context.state = newState(this.clock());
+    await this.save(context);
+    return this.telegram.send(context.chatId,
+      'New project started. Send its Notion page name and any useful files. I will inspect the files before asking questions.');
   }
 
   async receiveFile(context, message) {
@@ -234,20 +256,8 @@ export class AlignmentBot {
     const [action, projectId, extra, hash] = String(query.data || '').split(':');
     const state = context.state;
     if (projectId !== state.id) return this.telegram.send(context.chatId, 'That control belongs to an older project view. Send /start for the current one.');
-    if (action === 'new_cancel') {
-      if (!state.pendingNew) return this.telegram.send(context.chatId, 'That choice is no longer current. Send /start to continue.');
-      state.pendingNew = false;
-      await this.save(context);
-      await this.telegram.send(context.chatId, `Keeping ${escapeHtml(state.project.name)}.`);
-      return this.start(context);
-    }
-    if (action === 'new_confirm') {
-      if (!state.pendingNew || state.approved) return this.telegram.send(context.chatId, 'That choice is no longer current. Send /start to continue.');
-      context.state = newState(this.clock());
-      await this.save(context);
-      return this.telegram.send(context.chatId,
-        'New project started. Send its Notion page name and any useful files. I will inspect the files before asking questions.');
-    }
+    if (action === 'new_cancel') return this.cancelNew(context);
+    if (action === 'new_confirm') return this.confirmNew(context);
     if (state.pendingNew) return this.newProjectPrompt(context);
     if (action === 'saved') return this.showSaved(context);
     if (state.approved) return this.showSaved(context);
