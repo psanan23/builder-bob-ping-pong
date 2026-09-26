@@ -4,6 +4,14 @@ This branch adds the Telegram conversation while keeping the public Ping/Pong pa
 
 ## Render variables
 
+### Create the database first
+
+1. In [Neon](https://console.neon.tech/), create a free project. Choose a nearby region if Neon offers one.
+2. Open the project's **Connection Details**. Copy its Postgres connection string (the one beginning `postgresql://`); use the pooled connection option if offered. Keep the full string private.
+3. In Render, open **builder-bob-ping-pong → Environment**. Add a variable named `DATABASE_URL` and paste the full connection string as its value. Do not put it in a GitHub Environment or repository file.
+
+You do not need to create tables yourself. The bot creates its own tables when it starts.
+
 Add these to the **Render web service** Environment page, not to GitHub Environments or the repository:
 
 - `OPENAI_API_KEY` — existing OpenAI API key
