@@ -29,4 +29,6 @@ Render build command: `npm install`. Start command: `npm start`. Health check: `
 
 Send `/start`, then `Make a balcony reading corner`. Upload `examples/balcony-notes.txt`, tap **Files ready**, answer the numbered questions, ask about a recap assumption, correct it, and approve only the latest recap. Use `/saved` before and after a service restart to confirm that the same version returns.
 
+To replace an **unapproved** test project in the same private chat, send `/new` and choose **Start new project**. The bot replaces its current working details; earlier Telegram messages remain in the chat. This command does not replace an approved direction.
+
 Run `npm test` locally for the state-machine and storage checks. The tests use fake AI and Telegram responses; they do not establish a live result.
