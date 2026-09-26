@@ -349,6 +349,39 @@ test('new-project confirmation survives a restart; keeping the current project p
   assert.equal((await h.state()).stage, 'approved');
 });
 
+test('exact text choices can keep or replace an unapproved project without accepting stale approval', async () => {
+  const h = harness({ questions: [] });
+  await h.message('Make a balcony reading corner');
+  const oldId = (await h.state()).id;
+  await h.callback(`no_files:${oldId}`);
+  const oldRecap = (await h.state()).recap;
+
+  await h.message('/new');
+  assert.match(h.last().message, /reply exactly Start new project or Keep current project/);
+  await h.message('Start new project please');
+  assert.equal((await h.state()).id, oldId);
+  assert.equal((await h.state()).pendingNew, true);
+  await h.message('I approve this recap');
+  assert.equal((await h.state()).approved, null);
+
+  await h.message('Keep current project');
+  const kept = await h.state();
+  assert.equal(kept.pendingNew, false);
+  assert.equal(kept.id, oldId);
+  assert.deepEqual(kept.recap, oldRecap);
+  assert.match(h.last().message, /Recap — version 1/);
+
+  await h.message('/new');
+  await h.message('Start new project');
+  const fresh = await h.state();
+  assert.notEqual(fresh.id, oldId);
+  assert.equal(fresh.stage, 'awaiting_project');
+  assert.equal(fresh.recap, null);
+  assert.equal(fresh.approved, null);
+  await h.callback(`approve:${oldId}:${oldRecap.version}:${oldRecap.hash}`);
+  assert.match(h.last().message, /older project view/);
+});
+
 test('an approved direction cannot be replaced through the new-project command', async () => {
   const h = harness({ questions: [] });
   await h.message('Make a balcony reading corner');
