@@ -88,6 +88,23 @@ function approvalText(text) {
   return /^(?:i approve (?:this|the) recap|yes,? approve(?: this recap)?|(?:yes,? )?this (?:recap )?matches my (?:goal and )?approach)[.!]?$/i.test(text.trim());
 }
 
+// A request to move research or preparation from Bon to Builder Bob changes the
+// division of work, even when it is phrased as a question. Keep this narrow so
+// ordinary factual questions can still receive a simple answer.
+function roleReviewSignal(text) {
+  const work = '(?:research|verify|check|confirm|provide|draft|prepare|write|find|compare|organis[ez]e|handle|take care of|do)';
+  const owner = '(?:you|builder bob|bob)';
+  const request = [
+    new RegExp(`\\b${owner}\\s+(?:need to|should|must|have to)\\s+(?:help\\s+me\\s+(?:to\\s+|with\\s+)?|)${work}\\b`, 'i'),
+    new RegExp(`\\b${owner}\\s+can\\s+help\\s+me\\s+(?:to\\s+)?${work}\\b`, 'i'),
+    new RegExp(`\\b(?:can|could|would)\\s+you\\s+(?:please\\s+)?${work}\\b`, 'i'),
+    new RegExp(`\\b(?:i|we)\\s+(?:shouldn't|should not|don't|do not)\\s+have\\s+to\\s+${work}\\b`, 'i'),
+  ];
+  if (request.some((pattern) => pattern.test(text))) return 'correction';
+  if (/\bwhy\s+(?:can(?:['’]?t|not)|cannot)\s+you\s+(?:do|handle|research|verify|check|draft|prepare)\b/i.test(text)) return 'clarification';
+  return null;
+}
+
 function contextFor(state) {
   const referenceDate = state.metrics.selectedAt
     ? new Date(state.metrics.selectedAt).toLocaleDateString('en-CA', { timeZone: 'Asia/Singapore' })
@@ -177,6 +194,11 @@ export class AlignmentBot {
       if (approvalText(text)) return this.approve(context, context.state.recap.version, context.state.recap.hash);
       return this.discuss(context, text);
     }
+    if (stage === 'correction_pending') {
+      if (approvalText(text)) return this.telegram.send(context.chatId,
+        'I’m holding approval until we resolve who does this work and I show you a revised recap.');
+      return this.discuss(context, text);
+    }
     if (stage === 'blocked') return this.telegram.send(context.chatId, 'Please replace or remove the file I couldn’t read. Then tap Files ready.');
     return this.telegram.send(context.chatId, 'I’m still working on that step. Send /retry if it seems stuck.');
   }
@@ -187,6 +209,8 @@ export class AlignmentBot {
     if (!state.project.name) return this.telegram.send(context.chatId,
       'I’m Builder Bob. Send the Notion page name and any files for the task. We’ll agree the goal and approach, then save that direction for a later action plan.\n\nI can read TXT, MD, PDF, JPG, and PNG: up to 6 files, 10 MB each, and 20 pages per PDF. Supplied material is processed by the bot’s AI provider.');
     if (state.stage === 'recap') return this.sendRecap(context, false);
+    if (state.stage === 'correction_pending') return this.telegram.send(context.chatId,
+      'I’m holding approval while we resolve your question about who does that work. Tell me what you want changed in the recap.');
     if (state.stage === 'questions') return this.sendQuestions(context, true);
     if (state.stage === 'blocked') return this.sendCoverage(context);
     return this.telegram.send(context.chatId, `Project: ${escapeHtml(state.project.name)}\nYour information is saved. Send files or tap Files ready to continue.`, intakeButtons(state));
@@ -410,12 +434,20 @@ export class AlignmentBot {
     const version = (state.recap?.version || 0) + 1;
     const recap = Object.fromEntries(RECAP_FIELDS.map((field) => [field, short(
       state.patchedFields?.includes(field) ? state.proposedRecap?.[field] : draft[field], 650)]));
+    if (state.requiredRoleChange && state.recap &&
+      recap.builderHelp === state.recap.builderHelp && recap.bonNeeds === state.recap.bonNeeds) {
+      state.stage = 'ready_for_recap';
+      await this.save(context);
+      return this.telegram.send(context.chatId,
+        'I couldn’t reflect your change to who does the work yet. The earlier recap cannot be approved. Send /retry and I’ll revise it.');
+    }
     recap.version = version;
     recap.hash = recapHash(recap);
     recap.createdAt = this.clock();
     state.recap = recap;
     state.proposedRecap = null;
     state.patchedFields = null;
+    state.requiredRoleChange = false;
     state.recapHistory.push(recap);
     state.stage = 'recap';
     state.metrics.recapAt = this.clock();
@@ -435,18 +467,32 @@ export class AlignmentBot {
 
   async discuss(context, text) {
     const state = context.state;
+    const roleSignal = roleReviewSignal(text) || (state.stage === 'correction_pending' ? 'correction' : null);
     state.stage = 'processing_discussion';
     state.latestUserText = short(text, 3000);
     await this.save(context);
     let result;
     try { result = await this.ai.handleDiscussion(contextFor(state), text); }
-    catch { state.stage = 'recap'; await this.save(context); return this.telegram.send(context.chatId, 'I couldn’t answer that just now. Please send it again.'); }
-    if (result.kind === 'question' || result.kind === 'clarification') {
+    catch {
+      // A failed explanation must not reopen approval of a recap whose work
+      // assignment Bon has just challenged.
+      state.stage = roleSignal ? 'correction_pending' : 'recap';
+      await this.save(context);
+      return this.telegram.send(context.chatId, 'I couldn’t answer that just now. Please send it again.');
+    }
+    if (roleSignal === 'clarification' && result.kind !== 'correction') {
+      state.stage = 'correction_pending'; await this.save(context);
+      await this.telegram.send(context.chatId, escapeHtml(result.reply || 'I can help with research and preparation later.'));
+      return this.telegram.send(context.chatId,
+        'It sounds as if you want to change who does this work. What should I take over or prepare? I’ll revise the recap before you approve it.');
+    }
+    if (roleSignal !== 'correction' && (result.kind === 'question' || result.kind === 'clarification')) {
       state.stage = 'recap'; await this.save(context);
       await this.telegram.send(context.chatId, escapeHtml(result.reply || 'Which part would you like to change?'));
       return this.telegram.send(context.chatId, 'You can still approve the current recap, or tell me what to change.', recapButtons(state));
     }
     state.corrections.push({ text: short(text, 3000), at: this.clock() });
+    state.requiredRoleChange = Boolean(roleSignal);
     state.proposedRecap = { ...state.recap };
     state.patchedFields = [];
     if (result.patch && typeof result.patch === 'object') {
@@ -481,6 +527,10 @@ export class AlignmentBot {
   }
 
   async outdated(context) {
+    if (context.state.stage === 'correction_pending' || context.state.requiredRoleChange) {
+      return this.telegram.send(context.chatId,
+        'That approval is paused while I update who does the work. Please review the revised recap first.');
+    }
     await this.telegram.send(context.chatId, 'That approval is for an older recap. Please review the latest version.');
     if (context.state.stage === 'recap') await this.sendRecap(context, false);
   }
