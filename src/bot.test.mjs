@@ -272,6 +272,128 @@ test('a clear correction survives even if recap generation repeats the old wordi
   assert.equal((await h.state()).recapHistory[0].firstTwoWeeks, 'Shop for a chair.');
 });
 
+test('a requested shift of Embassy research and drafting to Builder Bob revises the recap even when AI calls it a question', async () => {
+  const ai = fakeAI({ questions: [] });
+  ai.makeRecap = async (context) => {
+    const corrections = context.corrections.map(({ text }) => text).join(' ');
+    return {
+      doneMeans: 'Both Thai passport applications are submitted.',
+      builderHelp: /draft an email/i.test(corrections)
+        ? 'I can check public requirements and draft an Embassy email in the later action plan.'
+        : /provide or verify/i.test(corrections)
+          ? 'I can check public Embassy requirements in the later action plan.'
+          : 'I can organize the later action plan.',
+      bonNeeds: corrections
+        ? 'You approve any message before it is sent and attend in person if required, because those steps need your authorization or presence.'
+        : 'You verify current Embassy requirements and appointment rules.',
+      firstTwoWeeks: 'First check the route, then prepare for the application.',
+      assumptionsDependencies: 'Current Embassy rules need checking; no message has been sent.',
+    };
+  };
+  ai.handleDiscussion = async () => ({ kind: 'question', reply: 'I can research later.' });
+  const h = harness({ ai });
+  await h.message('Thai passports for my daughters');
+  const id = (await h.state()).id;
+  await h.callback(`no_files:${id}`);
+  const first = (await h.state()).recap;
+
+  await h.message('Why cant you do this for me? You need to provide or verify current Embassy requirements and appointment rules.');
+  const second = (await h.state()).recap;
+  assert.equal(second.version, 2);
+  assert.match(second.builderHelp, /check public Embassy requirements/);
+  assert.doesNotMatch(second.bonNeeds, /You verify/);
+  assert.match(h.last().message, /Recap — version 2/);
+  await h.callback(`approve:${id}:${first.version}:${first.hash}`);
+  assert.equal((await h.state()).approved, null);
+
+  await h.message('You can help me draft an email to the Embassy so I do not waste time going in person just to ask.');
+  const third = (await h.state()).recap;
+  assert.equal(third.version, 3);
+  assert.match(third.builderHelp, /draft an Embassy email/);
+  assert.match(third.bonNeeds, /approve any message/);
+  assert.equal((await h.state()).corrections.length, 2);
+});
+
+test('a challenge to Bon doing the work pauses old approval until the role is clarified', async () => {
+  const ai = fakeAI({ questions: [] });
+  ai.handleDiscussion = async () => ({ kind: 'question', reply: 'The recap says you would check the rules.' });
+  ai.makeRecap = async (context) => ({
+    doneMeans: 'Both applications are submitted.',
+    builderHelp: context.corrections.length ? 'I can draft the Embassy inquiry later.' : 'I can organize the later plan.',
+    bonNeeds: context.corrections.length ? 'You approve sending because it needs your authorization.' : 'You check the Embassy rules.',
+    firstTwoWeeks: 'Check the route first.',
+    assumptionsDependencies: 'Embassy response is unresolved.',
+  });
+  const h = harness({ ai });
+  await h.message('Thai passports');
+  const id = (await h.state()).id;
+  await h.callback(`no_files:${id}`);
+  const first = (await h.state()).recap;
+  await h.message('Why cant you do this for me?');
+  assert.equal((await h.state()).stage, 'correction_pending');
+  assert.match(h.last().message, /What should I take over or prepare/);
+  await h.callback(`approve:${id}:${first.version}:${first.hash}`);
+  assert.equal((await h.state()).approved, null);
+  assert.match(h.last().message, /approval is paused/);
+  await h.message('I approve this recap');
+  assert.equal((await h.state()).approved, null);
+  await h.message('Draft the Embassy inquiry for my approval.');
+  assert.equal((await h.state()).recap.version, 2);
+  assert.equal((await h.state()).stage, 'recap');
+});
+
+test('a failed response to a role challenge keeps approval paused', async () => {
+  const ai = fakeAI({ questions: [] });
+  ai.handleDiscussion = async () => { throw new Error('AI unavailable'); };
+  const h = harness({ ai });
+  await h.message('Thai passports');
+  const id = (await h.state()).id;
+  await h.callback(`no_files:${id}`);
+  const first = (await h.state()).recap;
+
+  await h.message('Why cant you do this for me?');
+  assert.equal((await h.state()).stage, 'correction_pending');
+  await h.callback(`approve:${id}:${first.version}:${first.hash}`);
+  assert.equal((await h.state()).approved, null);
+});
+
+test('an unchanged AI recap cannot make a requested role change approvable', async () => {
+  const ai = fakeAI({ questions: [] });
+  ai.handleDiscussion = async () => ({ kind: 'question', reply: 'I can do that later.' });
+  ai.makeRecap = async () => ({
+    doneMeans: 'Both applications are submitted.',
+    builderHelp: 'I can organize the later plan.',
+    bonNeeds: 'You verify current Embassy requirements.',
+    firstTwoWeeks: 'Check the route first.',
+    assumptionsDependencies: 'Embassy response is unresolved.',
+  });
+  const h = harness({ ai });
+  await h.message('Thai passports');
+  const id = (await h.state()).id;
+  await h.callback(`no_files:${id}`);
+  const first = (await h.state()).recap;
+  await h.message('You need to verify the Embassy requirements for me.');
+  assert.equal((await h.state()).stage, 'ready_for_recap');
+  assert.equal((await h.state()).recap.version, 1);
+  assert.match(h.last().message, /earlier recap cannot be approved/);
+  await h.callback(`approve:${id}:${first.version}:${first.hash}`);
+  assert.equal((await h.state()).approved, null);
+});
+
+test('an ordinary factual question keeps the current recap approvable', async () => {
+  const h = harness({ questions: [] });
+  await h.message('Make a balcony reading corner');
+  const id = (await h.state()).id;
+  await h.callback(`no_files:${id}`);
+  const current = (await h.state()).recap;
+  await h.message('Why does the plan include shopping?');
+  assert.equal((await h.state()).stage, 'recap');
+  assert.equal((await h.state()).recap.version, current.version);
+  assert.match(h.telegram.sent.at(-2).message, /assumes the balcony/);
+  await h.callback(`approve:${id}:${current.version}:${current.hash}`);
+  assert.equal((await h.state()).stage, 'approved');
+});
+
 test('an ambiguous reply cannot approve; an explicit current-recap statement can', async () => {
   const ai = fakeAI({ questions: [] });
   ai.handleDiscussion = async () => ({ kind: 'clarification', reply: 'Do you want to change anything?' });
