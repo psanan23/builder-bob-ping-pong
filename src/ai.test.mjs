@@ -17,7 +17,8 @@ async function withResponses(responses, run) {
   globalThis.fetch = async (_, options) => {
     requests.push(JSON.parse(options.body));
     assert.ok(responses.length, 'Unexpected API request');
-    return { ok: true, json: async () => responses.shift() };
+    const next = responses.shift();
+    return { ok: !next._httpStatus, status: next._httpStatus || 200, json: async () => next };
   };
   try { await run(requests); assert.equal(responses.length, 0); }
   finally { globalThis.fetch = oldFetch; if (oldKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = oldKey; }
@@ -106,5 +107,17 @@ test('a preference correction retains prior checked sources and their original c
     assert.equal(result.prerequisites[0].status, 'confirmed');
     assert.equal(result.sources[0].checkedAt, previous.checkedAt);
     assert.ok(requests.every((r) => !r.tools));
+  });
+});
+
+
+test('API failures expose only safe stage/status/code/parameter diagnostics', async () => {
+  await withResponses([structured(lookupPlan), { _httpStatus: 400, error: { code: 'unsupported_parameter', param: 'max_tool_calls', message: 'Secret private content must not appear' } }], async () => {
+    await assert.rejects(verifyDirection({}), (error) => {
+      assert.equal(error.operation, 'official_site_lookup');
+      assert.equal(error.code, 'http_400:unsupported_parameter:max_tool_calls');
+      assert.doesNotMatch(error.message, /Secret private/);
+      return true;
+    });
   });
 });
