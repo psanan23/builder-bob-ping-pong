@@ -494,7 +494,10 @@ export class AlignmentBot {
         state.directionInputHash = inputHash;
         state.metrics.directionAt = this.clock();
         await this.save(context);
-      } catch {
+      } catch (error) {
+        const safeDiagnostic = (value) => /^[a-zA-Z0-9_.:\[\]-]{1,180}$/.test(String(value || '')) ? value : 'unknown';
+        state.lastDirectionError = { code: safeDiagnostic(error?.code), operation: safeDiagnostic(error?.operation), at: this.clock() };
+        console.error('Direction check failed:', state.lastDirectionError.operation, state.lastDirectionError.code);
         state.stage = 'ready_for_recap'; await this.save(context);
         return this.telegram.send(context.chatId, 'I couldn’t finish the direction check. I’m holding the recap until I can check it. Send /retry to continue.');
       }
