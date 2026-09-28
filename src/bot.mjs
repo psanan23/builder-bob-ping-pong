@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { PDFDocument } from 'pdf-lib';
 import { escapeHtml } from './telegram.mjs';
+import { publicUrl } from './ai.mjs';
 
 const MAX_FILES = 6;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -27,6 +28,10 @@ function newState(now) {
     recapHistory: [],
     corrections: [],
     approved: null,
+    approvalHistory: [],
+    reviewingApproved: false,
+    direction: null,
+    directionInputHash: null,
     pendingNew: false,
     metrics: { selectedAt: null, firstResultAt: null, finalAnswerAt: null, recapAt: null, approvalAt: null },
     createdAt: now,
@@ -44,13 +49,45 @@ function short(text, limit = 500) {
 
 function recapHash(recap) {
   const values = Object.fromEntries(RECAP_FIELDS.map((field) => [field, recap[field]]));
+  values.sources = recap.sources || [];
   return createHash('sha256').update(JSON.stringify(values)).digest('hex').slice(0, 14);
+}
+
+function publicSources(direction) {
+  return (direction?.sources || []).filter(({ url }) => publicUrl(url))
+    .slice(0, 8).map(({ title, url, supports, checkedAt }) => ({ title: short(title || 'Primary source', 100), url: publicUrl(url), supports: short(supports, 250), checkedAt: checkedAt || direction.checkedAt }));
+}
+
+function approvedVersions(state) {
+  const history = [...(state.approvalHistory || [])];
+  if (state.approved && !history.some(({ recap }) => recap.version === state.approved.recap.version)) history.push(state.approved);
+  return history.sort((a, b) => a.recap.version - b.recap.version);
+}
+
+function savedButtons(state) {
+  const rows = [[{ text: 'Show saved recap', callback_data: `saved:${state.id}` },
+    { text: 'Review saved direction', callback_data: `review:${state.id}` }]];
+  if (approvedVersions(state).length > 1) rows.push([{ text: 'Earlier approvals', callback_data: `history:${state.id}` }]);
+  return rows;
+}
+
+function directionInputHash(state) {
+  return createHash('sha256').update(JSON.stringify({
+    project: state.project,
+    sources: state.sources.filter(({ status }) => status === 'read').map(({ name, facts, summary }) => ({ name, facts, summary })),
+    questions: state.questions,
+    corrections: state.corrections,
+  })).digest('hex');
 }
 
 function recapText(state) {
   const recap = state.recap;
   const parts = [`<b>${escapeHtml(state.project.name)} · Recap — version ${recap.version}</b>`];
   RECAP_FIELDS.forEach((field, index) => parts.push(`<b>${LABELS[index]}</b>\n${escapeHtml(recap[field])}`));
+  if (recap.sources?.length) {
+    parts.push(`<b>Sources for this route</b>\n${recap.sources.slice(0, 3).map(({ title, url }) => `<a href="${escapeHtml(url)}">${escapeHtml(title)}</a>`).join('\n')}`);
+    if (recap.sources.length > 3) parts.push('Send /sources to see all supporting sources.');
+  }
   parts.push('Does this match your goal and approach? Approve this recap, or tell me what to change.');
   return parts.join('\n\n');
 }
@@ -117,6 +154,8 @@ function contextFor(state) {
     questions: state.questions,
     recap: (state.proposedRecap || state.recap) ? Object.fromEntries(RECAP_FIELDS.map((field) => [field, (state.proposedRecap || state.recap)[field]])) : null,
     corrections: state.corrections,
+    direction: state.direction || null,
+    validationIssues: state.recapValidationIssues || [],
   };
 }
 
@@ -165,12 +204,20 @@ export class AlignmentBot {
     }
     if (text === '/start') return this.start(context);
     if (text === '/retry') return this.retry(context);
-    if (text === '/saved') return this.showSaved(context);
+    if (/^\/saved(?: \d+)?$/.test(text)) return this.showSaved(context, text.split(' ')[1]);
+    if (text === '/review') return this.beginReview(context);
+    if (text === '/history') return this.showHistory(context);
+    if (text === '/sources') return this.showSources(context);
     if (message.document || message.photo?.length) return this.receiveFile(context, message);
     if (!text) return this.telegram.send(context.chatId, 'Send the project name or a file to continue.');
-    if (context.state.approved) return this.showSaved(context);
 
     const stage = context.state.stage;
+    if (stage === 'approved') return this.discuss(context, text);
+    if (stage === 'reviewing_saved') {
+      if (approvalText(text)) return this.telegram.send(context.chatId,
+        'Tell me what you want changed first. I’ll show a revised recap for you to approve.');
+      return this.discuss(context, text);
+    }
     if (!context.state.project.name) {
       const [name, ...description] = text.split('\n');
       context.state.project.name = short(name, 120);
@@ -205,7 +252,8 @@ export class AlignmentBot {
 
   async start(context) {
     const state = context.state;
-    if (state.approved) return this.showSaved(context);
+    if (state.stage === 'approved' && !state.reviewingApproved) return this.showSaved(context);
+    if (state.stage === 'reviewing_saved') return this.reviewPrompt(context);
     if (!state.project.name) return this.telegram.send(context.chatId,
       'I’m Builder Bob. Send the Notion page name and any files for the task. We’ll agree the goal and approach, then save that direction for a later action plan.\n\nI can read TXT, MD, PDF, JPG, and PNG: up to 6 files, 10 MB each, and 20 pages per PDF. Supplied material is processed by the bot’s AI provider.');
     if (state.stage === 'recap') return this.sendRecap(context, false);
@@ -213,6 +261,8 @@ export class AlignmentBot {
       'I’m holding approval while we resolve your question about who does that work. Tell me what you want changed in the recap.');
     if (state.stage === 'questions') return this.sendQuestions(context, true);
     if (state.stage === 'blocked') return this.sendCoverage(context);
+    if (['verifying_direction', 'generating_recap', 'ready_for_recap', 'processing_discussion'].includes(state.stage)) return this.telegram.send(context.chatId,
+      'Your information is saved. Send /retry to continue checking the direction.');
     return this.telegram.send(context.chatId, `Project: ${escapeHtml(state.project.name)}\nYour information is saved. Send files or tap Files ready to continue.`, intakeButtons(state));
   }
 
@@ -254,7 +304,11 @@ export class AlignmentBot {
 
   async receiveFile(context, message) {
     const state = context.state;
-    if (state.approved) return this.telegram.send(context.chatId, 'The direction is already saved. Send /saved to see it again.');
+    if (state.approved && !state.reviewingApproved) {
+      state.approvalHistory = approvedVersions(state);
+      state.reviewingApproved = true;
+      await this.telegram.send(context.chatId, 'I’ll read this new material and review the direction. Your earlier approved recap remains saved.');
+    }
     const document = message.document;
     const photo = message.photo?.at(-1);
     const name = safeName(document?.file_name || `photo-${photo?.file_unique_id || Date.now()}.jpg`);
@@ -283,8 +337,9 @@ export class AlignmentBot {
     if (action === 'new_cancel') return this.cancelNew(context);
     if (action === 'new_confirm') return this.confirmNew(context);
     if (state.pendingNew) return this.newProjectPrompt(context);
-    if (action === 'saved') return this.showSaved(context);
-    if (state.approved) return this.showSaved(context);
+    if (action === 'saved') return this.showSaved(context, extra);
+    if (action === 'history') return this.showHistory(context);
+    if (action === 'review') return this.beginReview(context);
     if (action === 'files_ready') return this.finishFiles(context, false);
     if (action === 'no_files') return this.finishFiles(context, true);
     if (action === 'retry_file') {
@@ -351,7 +406,7 @@ export class AlignmentBot {
     await this.save(context);
     await this.sendCoverage(context);
     if (state.stage === 'blocked') return;
-    if (state.recap) return this.buildRecap(context, 'I read new material supplied before approval.');
+    if (state.recap) return this.buildRecap(context, 'I read the new material and checked the direction again.');
     if (state.questions.length) {
       state.stage = 'questions'; await this.save(context);
       return this.sendQuestions(context, true);
@@ -423,37 +478,69 @@ export class AlignmentBot {
 
   async buildRecap(context, changeNote = '') {
     const state = context.state;
+    if (state.sources.some(({ status }) => ['pending', 'blocked'].includes(status))) {
+      state.stage = 'blocked'; await this.save(context); return this.sendCoverage(context);
+    }
+    const inputHash = directionInputHash(state);
+    if (!state.direction || state.directionInputHash !== inputHash) {
+      state.stage = 'verifying_direction'; await this.save(context);
+      await this.telegram.send(context.chatId, 'Checking the prerequisites and facts that could change the route.');
+      try {
+        const direction = await this.ai.verifyDirection(contextFor(state));
+        if (!direction?.outcome || !Array.isArray(direction.sequence) || !direction.sequence.length || !Array.isArray(direction.prerequisites) ||
+          !direction.applicationAppointment || !Array.isArray(direction.ownership) || !Array.isArray(direction.uncertainties)) throw new Error('Incomplete direction');
+        direction.sources = publicSources(direction);
+        state.direction = direction;
+        state.directionInputHash = inputHash;
+        state.metrics.directionAt = this.clock();
+        await this.save(context);
+      } catch {
+        state.stage = 'ready_for_recap'; await this.save(context);
+        return this.telegram.send(context.chatId, 'I couldn’t finish the direction check. I’m holding the recap until I can check it. Send /retry to continue.');
+      }
+    }
     state.stage = 'generating_recap'; await this.save(context);
-    let draft;
-    try { draft = await this.ai.makeRecap(contextFor(state)); }
-    catch { state.stage = 'ready_for_recap'; await this.save(context); return this.telegram.send(context.chatId, 'I couldn’t finish the recap yet. Send /retry to try again.'); }
-    if (RECAP_FIELDS.some((field) => !String(draft?.[field] || '').trim())) {
+    let recap;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const draft = await this.ai.makeRecap(contextFor(state));
+        const candidate = Object.fromEntries(RECAP_FIELDS.map((field) => [field,
+          String(state.patchedFields?.includes(field) ? state.proposedRecap?.[field] || '' : draft?.[field] || '').trim()]));
+        candidate.sources = publicSources(state.direction);
+        const issues = [];
+        if (RECAP_FIELDS.some((field) => !candidate[field])) issues.push('Complete all five recap sections.');
+        if (recapText({ ...state, recap: { ...candidate, version: (state.recap?.version || 0) + 1 } }).length > 4000) issues.push('Make the recap fit one Telegram message without losing material caveats.');
+        if (state.requiredRoleChange && state.recap && candidate.builderHelp === state.recap.builderHelp && candidate.bonNeeds === state.recap.bonNeeds) issues.push('Reflect the requested change in ownership.');
+        if (!issues.length) {
+          const review = await this.ai.validateRecap(contextFor(state), candidate);
+          if (review?.valid !== true || review?.issues?.length) issues.push(...(review?.issues?.length ? review.issues : ['Check the recap against the verified direction.']));
+        }
+        if (!issues.length) { recap = candidate; break; }
+        state.recapValidationIssues = issues;
+        // Generate a complete consistent revision, rather than retaining a stale patch.
+        state.proposedRecap = null; state.patchedFields = null;
+        await this.save(context);
+      } catch {
+        state.stage = 'ready_for_recap'; await this.save(context);
+        return this.telegram.send(context.chatId, 'I couldn’t finish checking the recap yet. The earlier version cannot be approved. Send /retry to continue.');
+      }
+    }
+    if (!recap) {
       state.stage = 'ready_for_recap'; await this.save(context);
-      return this.telegram.send(context.chatId, 'The recap was incomplete. Send /retry to try again.');
+      return this.telegram.send(context.chatId, 'The recap still needs a correction. The earlier recap cannot be approved. Send /retry and I’ll revise it.');
     }
-    const version = (state.recap?.version || 0) + 1;
-    const recap = Object.fromEntries(RECAP_FIELDS.map((field) => [field, short(
-      state.patchedFields?.includes(field) ? state.proposedRecap?.[field] : draft[field], 650)]));
-    if (state.requiredRoleChange && state.recap &&
-      recap.builderHelp === state.recap.builderHelp && recap.bonNeeds === state.recap.bonNeeds) {
-      state.stage = 'ready_for_recap';
-      await this.save(context);
-      return this.telegram.send(context.chatId,
-        'I couldn’t reflect your change to who does the work yet. The earlier recap cannot be approved. Send /retry and I’ll revise it.');
-    }
-    recap.version = version;
+    recap.version = (state.recap?.version || 0) + 1;
     recap.hash = recapHash(recap);
     recap.createdAt = this.clock();
     state.recap = recap;
-    state.proposedRecap = null;
-    state.patchedFields = null;
-    state.requiredRoleChange = false;
+    state.proposedRecap = null; state.patchedFields = null;
+    state.requiredRoleChange = false; state.recapValidationIssues = [];
     state.recapHistory.push(recap);
     state.stage = 'recap';
     state.metrics.recapAt = this.clock();
     await this.save(context);
     if (changeNote) await this.telegram.send(context.chatId, `Changed: ${escapeHtml(changeNote)}`);
-    return this.sendRecap(context, version === 1);
+    return this.sendRecap(context, recap.version === 1);
   }
 
   async sendRecap(context, first) {
@@ -467,38 +554,46 @@ export class AlignmentBot {
 
   async discuss(context, text) {
     const state = context.state;
-    const roleSignal = roleReviewSignal(text) || (state.stage === 'correction_pending' ? 'correction' : null);
+    const wasApproved = state.stage === 'approved';
+    const wasReviewing = state.stage === 'reviewing_saved';
+    const roleSignal = roleReviewSignal(text);
+    const correctionRequired = roleSignal === 'correction' || state.stage === 'correction_pending';
     state.stage = 'processing_discussion';
     state.latestUserText = short(text, 3000);
     await this.save(context);
     let result;
     try { result = await this.ai.handleDiscussion(contextFor(state), text); }
     catch {
-      // A failed explanation must not reopen approval of a recap whose work
-      // assignment Bon has just challenged.
-      state.stage = roleSignal ? 'correction_pending' : 'recap';
+      // Hold approval when the message could expose a material error. Preserve all snapshots.
+      state.stage = 'correction_pending';
+      if (roleSignal) state.requiredRoleChange = true;
+      if (state.approved) { state.approvalHistory = approvedVersions(state); state.reviewingApproved = true; }
       await this.save(context);
-      return this.telegram.send(context.chatId, 'I couldn’t answer that just now. Please send it again.');
+      return this.telegram.send(context.chatId, 'I couldn’t check that reply just now. Your saved recap is still here; approval of a revision is paused. Send /retry or repeat your change.');
     }
     if (roleSignal === 'clarification' && result.kind !== 'correction') {
-      state.stage = 'correction_pending'; await this.save(context);
+      state.stage = 'correction_pending';
+      if (state.approved) state.reviewingApproved = true;
+      await this.save(context);
       await this.telegram.send(context.chatId, escapeHtml(result.reply || 'I can help with research and preparation later.'));
-      return this.telegram.send(context.chatId,
-        'It sounds as if you want to change who does this work. What should I take over or prepare? I’ll revise the recap before you approve it.');
+      return this.telegram.send(context.chatId, 'What should I take over or prepare? I’ll revise the recap before you approve it.');
     }
-    if (roleSignal !== 'correction' && (result.kind === 'question' || result.kind === 'clarification')) {
-      state.stage = 'recap'; await this.save(context);
+    if (!correctionRequired && (result.kind === 'question' || result.kind === 'clarification')) {
+      state.stage = wasApproved ? 'approved' : wasReviewing ? 'reviewing_saved' : 'recap';
+      await this.save(context);
       await this.telegram.send(context.chatId, escapeHtml(result.reply || 'Which part would you like to change?'));
+      if (state.stage === 'approved') return;
+      if (state.stage === 'reviewing_saved') return this.reviewPrompt(context);
       return this.telegram.send(context.chatId, 'You can still approve the current recap, or tell me what to change.', recapButtons(state));
     }
+    if (state.approved) { state.approvalHistory = approvedVersions(state); state.reviewingApproved = true; }
     state.corrections.push({ text: short(text, 3000), at: this.clock() });
-    state.requiredRoleChange = Boolean(roleSignal);
-    state.proposedRecap = { ...state.recap };
-    state.patchedFields = [];
-    if (result.patch && typeof result.patch === 'object') {
-      for (const field of RECAP_FIELDS) if (String(result.patch[field] || '').trim()) {
-        state.proposedRecap[field] = short(result.patch[field], 650);
-        state.patchedFields.push(field);
+    state.requiredRoleChange = Boolean(roleSignal) || Boolean(state.requiredRoleChange);
+    // Retain explicit corrections, then validate the complete result against the new evidence.
+    state.proposedRecap = { ...state.recap }; state.patchedFields = [];
+    for (const field of RECAP_FIELDS) {
+      if (typeof result.patch?.[field] === 'string' && result.patch[field].trim()) {
+        state.proposedRecap[field] = result.patch[field].trim(); state.patchedFields.push(field);
       }
     }
     state.stage = 'ready_for_recap'; await this.save(context);
@@ -508,22 +603,59 @@ export class AlignmentBot {
   async approve(context, version, hash) {
     const state = context.state;
     if (state.stage !== 'recap' || state.recap?.version !== version || state.recap?.hash !== hash) return this.outdated(context);
-    const snapshot = { project: { ...state.project }, recap: { ...state.recap }, message: recapText(state), approvedAt: this.clock(), chatId: context.chatId };
+    const previous = { approved: state.approved, approvalHistory: state.approvalHistory, stage: state.stage, reviewingApproved: state.reviewingApproved, approvalAt: state.metrics.approvalAt };
+    const snapshot = structuredClone({ project: state.project, recap: state.recap, direction: state.direction, message: recapText(state), approvedAt: this.clock(), chatId: context.chatId });
+    state.approvalHistory = [...approvedVersions(state), snapshot];
     state.approved = snapshot;
-    state.stage = 'approved';
+    state.stage = 'approved'; state.reviewingApproved = false;
     state.metrics.approvalAt = snapshot.approvedAt;
     try { await this.save(context); }
-    catch { return this.telegram.send(context.chatId, 'I couldn’t save that yet. Your approval is still here; please retry saving by pressing Approve this recap again.'); }
+    catch {
+      const { approvalAt, ...fields } = previous;
+      Object.assign(state, fields); state.metrics.approvalAt = approvalAt;
+      return this.telegram.send(context.chatId, 'I couldn’t save that yet. Please press Approve this recap again.');
+    }
     return this.telegram.send(context.chatId,
-      `Direction saved — version ${version}. We’ll use this agreed goal and approach for a later action plan.`,
-      [[{ text: 'Show saved recap', callback_data: `saved:${state.id}` }]]);
+      `Direction saved — version ${version}. We’ll use this agreed goal and approach for a later action plan. You can send /review or simply tell me what needs changing.`, savedButtons(state));
   }
 
-  async showSaved(context) {
-    const approved = context.state.approved;
-    if (!approved) return this.telegram.send(context.chatId, 'No direction has been saved yet. Send /start to continue.');
-    return this.telegram.send(context.chatId, approved.message,
-      [[{ text: 'Show saved recap', callback_data: `saved:${context.state.id}` }]]);
+  async showSaved(context, version) {
+    const state = context.state;
+    const approved = version ? approvedVersions(state).find(({ recap }) => recap.version === Number(version)) : state.approved;
+    if (!approved) return this.telegram.send(context.chatId, 'No approved direction with that version is saved. Send /start to continue.');
+    if (state.reviewingApproved) await this.telegram.send(context.chatId, 'This is the earlier approved direction. A revision is under review and needs its own approval.');
+    return this.telegram.send(context.chatId, approved.message, savedButtons(state));
+  }
+
+  async beginReview(context) {
+    const state = context.state;
+    if (!state.approved) return this.telegram.send(context.chatId, 'No direction is saved yet. Send /start to review the current recap.');
+    if (state.reviewingApproved) return this.start(context);
+    state.approvalHistory = approvedVersions(state);
+    state.reviewingApproved = true; state.stage = 'reviewing_saved';
+    await this.save(context);
+    await this.showSaved(context);
+    return this.reviewPrompt(context);
+  }
+
+  async reviewPrompt(context) {
+    return this.telegram.send(context.chatId, 'What would you like to question or change? I’ll keep the earlier approval and show any revised direction for a fresh approval.');
+  }
+
+  async showHistory(context) {
+    const versions = approvedVersions(context.state);
+    if (!versions.length) return this.showSaved(context);
+    return this.telegram.send(context.chatId, '<b>Approved directions</b>\n' + versions.map(({ recap, approvedAt }) => `Version ${recap.version} — ${escapeHtml(approvedAt)}`).join('\n'),
+      versions.slice(-8).map(({ recap }) => [{ text: `Show version ${recap.version}`, callback_data: `saved:${context.state.id}:${recap.version}` }]));
+  }
+
+  async showSources(context) {
+    const state = context.state;
+    const direction = state.stage === 'approved' ? state.approved?.direction : state.direction;
+    const sources = publicSources(direction);
+    if (!sources.length) return this.telegram.send(context.chatId, 'No public sources have been saved for this direction. Its supplied evidence and unresolved checks are recorded with the recap.');
+    return this.telegram.send(context.chatId, '<b>Sources for this direction</b>\n\n' + sources.map(({ title, url, supports, checkedAt }) =>
+      `<a href="${escapeHtml(url)}">${escapeHtml(title)}</a>\n${escapeHtml(supports)}${checkedAt ? `\nChecked: ${escapeHtml(checkedAt.slice(0, 10))}` : ''}`).join('\n\n'));
   }
 
   async outdated(context) {
@@ -540,8 +672,8 @@ export class AlignmentBot {
     if (stage === 'approved') return this.showSaved(context);
     if (stage === 'collecting' || stage === 'collecting_new_file' || stage === 'blocked' || stage === 'inspecting') return this.finishFiles(context, false);
     if (stage === 'inspection_done' || stage === 'generating_questions') return this.askQuestions(context);
-    if (stage === 'ready_for_recap' || stage === 'generating_recap') return this.buildRecap(context);
-    if (stage === 'processing_discussion' && context.state.latestUserText) return this.discuss(context, context.state.latestUserText);
+    if (['ready_for_recap', 'generating_recap', 'verifying_direction'].includes(stage)) return this.buildRecap(context);
+    if (['processing_discussion', 'correction_pending'].includes(stage) && context.state.latestUserText) return this.discuss(context, context.state.latestUserText);
     return this.start(context);
   }
 }
