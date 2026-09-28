@@ -75,6 +75,15 @@ test('a required public lookup that does not call the tool fails visibly', async
   });
 });
 
+test('a search without any usable authority evidence cannot produce an approvable direction', async () => {
+  const emptyEvidence = structuredClone(research);
+  emptyEvidence.output[0].action.sources = [{ url: 'https://unrelated.example.com/guide' }];
+  emptyEvidence.output[1].content[0].annotations = [];
+  await withResponses([structured(lookupPlan), emptyEvidence], async () => {
+    await assert.rejects(verifyDirection({}), (error) => error.code === 'no_authoritative_sources');
+  });
+});
+
 test('no material gaps yields zero questions and generic rules do not embed the passport case', async () => {
   await withResponses([structured({ questions: [] })], async (requests) => {
     assert.deepEqual(await askQuestions({}), []);

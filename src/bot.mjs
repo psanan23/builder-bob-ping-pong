@@ -73,6 +73,7 @@ function savedButtons(state) {
 
 function directionInputHash(state) {
   return createHash('sha256').update(JSON.stringify({
+    verificationPolicyVersion: 2,
     project: state.project,
     sources: state.sources.filter(({ status }) => status === 'read').map(({ name, facts, summary }) => ({ name, facts, summary })),
     questions: state.questions,
@@ -493,6 +494,7 @@ export class AlignmentBot {
         state.direction = direction;
         state.directionInputHash = inputHash;
         state.metrics.directionAt = this.clock();
+        console.info('Direction check completed:', `lookup=${Boolean(direction.lookup?.performed)}`, `tool=${direction.lookup?.tool || 'none'}`, `sources=${direction.sources.length}`);
         await this.save(context);
       } catch (error) {
         const safeDiagnostic = (value) => /^[a-zA-Z0-9_.:\[\]-]{1,180}$/.test(String(value || '')) ? value : 'unknown';
