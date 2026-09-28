@@ -26,7 +26,7 @@ function fakeTelegram(files = {}) {
 
 function fakeAI({ questions = [], readable = true } = {}) {
   return {
-    calls: { inspect: [], ask: [], answers: [], recap: [], discussion: [] },
+    calls: { inspect: [], ask: [], answers: [], direction: [], recap: [], validation: [], discussion: [] },
     async inspectFile(file) {
       this.calls.inspect.push(file);
       return readable
@@ -43,6 +43,22 @@ function fakeAI({ questions = [], readable = true } = {}) {
         .map((match) => ({ index: Number(match[1]), answer: match[2] }));
       return { answers, followup: 'Please include a question number.' };
     },
+    async verifyDirection(context) {
+      this.calls.direction.push(structuredClone(context));
+      return {
+        outcome: 'A comfortable balcony reading corner is ready to use.',
+        sequence: ['Check the physical space and choose a layout.', 'Prepare the later plan.'],
+        prerequisites: [],
+        applicationAppointment: { exists: 'not_applicable', detail: 'No application or appointment is needed.', sourceUrls: [] },
+        ownership: [
+          { work: 'Compare options and prepare the later plan.', owner: 'Builder Bob', reason: 'Available preparation.' },
+          { work: 'Choose the layout.', owner: 'Bon', reason: 'Personal judgement about her space.' },
+        ],
+        uncertainties: [], sources: [],
+        lookup: { performed: false, reason: 'No external fact is needed for this test direction.' },
+        checkedAt: CLOCK,
+      };
+    },
     async makeRecap(context) {
       this.calls.recap.push(structuredClone(context));
       const correction = context.corrections.length > 0;
@@ -55,6 +71,10 @@ function fakeAI({ questions = [], readable = true } = {}) {
           : 'Week 1: measure the space. Week 2: shop for a chair and set it up.',
         assumptionsDependencies: 'Assumes the balcony is safe; check building rules before setup.',
       };
+    },
+    async validateRecap(context, draft) {
+      this.calls.validation.push({ context: structuredClone(context), draft: structuredClone(draft) });
+      return { valid: true, issues: [] };
     },
     async handleDiscussion(context, reply) {
       this.calls.discussion.push({ context: structuredClone(context), reply });
@@ -519,4 +539,174 @@ test('an approved direction cannot be replaced through the new-project command',
   assert.deepEqual((await h.state()).approved, approved);
   await h.message('/saved');
   assert.equal(h.last().message, approved.message);
+});
+
+async function ready(h) {
+  await h.message('Make a balcony reading corner');
+  const id = (await h.state()).id;
+  await h.callback(`no_files:${id}`);
+  return id;
+}
+async function approveCurrent(h) {
+  const state = await h.state();
+  await h.callback(`approve:${state.id}:${state.recap.version}:${state.recap.hash}`);
+}
+
+test('direction verification happens before drafting and validation before approval controls', async () => {
+  const h = harness();
+  const order = [];
+  for (const method of ['verifyDirection', 'makeRecap', 'validateRecap']) {
+    const original = h.ai[method].bind(h.ai);
+    h.ai[method] = async (...args) => { order.push(method); return original(...args); };
+  }
+  await ready(h);
+  assert.deepEqual(order, ['verifyDirection', 'makeRecap', 'validateRecap']);
+  assert.equal((await h.state()).stage, 'recap');
+});
+
+test('a failed direction check cannot produce an approvable recap; retry checks again', async () => {
+  const h = harness(); const original = h.ai.verifyDirection.bind(h.ai);
+  h.ai.verifyDirection = async () => { throw new Error('offline'); };
+  await ready(h);
+  assert.equal((await h.state()).recap, null);
+  assert.equal((await h.state()).stage, 'ready_for_recap');
+  assert.equal(h.telegram.sent.some(({ buttons }) => buttons?.flat().some(({ text }) => text === 'Approve this recap')), false);
+  h.ai.verifyDirection = original;
+  await h.message('/retry');
+  assert.equal((await h.state()).stage, 'recap');
+});
+
+test('semantic errors get one regeneration and cannot reopen an earlier approval', async () => {
+  const h = harness(); await ready(h); const old = (await h.state()).recap;
+  h.ai.validateRecap = async () => ({ valid: false, issues: ['A required prerequisite is missing.'] });
+  await h.message('Change the route to complete the prerequisite first.');
+  assert.equal(h.ai.calls.recap.length, 3);
+  assert.equal((await h.state()).stage, 'ready_for_recap');
+  assert.equal((await h.state()).recap.version, old.version);
+  await h.callback(`approve:${(await h.state()).id}:${old.version}:${old.hash}`);
+  assert.equal((await h.state()).approved, null);
+  assert.deepEqual(h.ai.calls.recap.at(-1).validationIssues, ['A required prerequisite is missing.']);
+});
+
+test('retry reuses checked direction when inputs have not changed', async () => {
+  const h = harness(); let valid = false;
+  h.ai.validateRecap = async () => ({ valid, issues: valid ? [] : ['Fix a dependency.'] });
+  await ready(h);
+  assert.equal(h.ai.calls.direction.length, 1);
+  valid = true; await h.message('/retry');
+  assert.equal(h.ai.calls.direction.length, 1);
+  await h.message('Change the two-week milestone.');
+  assert.equal(h.ai.calls.direction.length, 2);
+});
+
+test('postapproval questions retain approval, natural corrections make a new proposed version', async () => {
+  const h = harness(); await ready(h); await approveCurrent(h);
+  const v1 = structuredClone((await h.state()).approved);
+  await h.message('Why this layout?');
+  assert.equal((await h.state()).stage, 'approved');
+  assert.equal(h.ai.calls.direction.length, 1);
+  await h.message('Use the existing chair.');
+  let state = await h.state();
+  assert.equal(state.stage, 'recap'); assert.equal(state.recap.version, 2);
+  assert.deepEqual(state.approved, v1);
+  await h.message('/saved'); assert.equal(h.last().message, v1.message);
+  await h.callback(`approve:${state.id}:1:${v1.recap.hash}`);
+  assert.equal((await h.state()).approved.recap.version, 1);
+  await approveCurrent(h);
+  state = await h.state();
+  assert.equal(state.approved.recap.version, 2);
+  assert.equal(state.approvalHistory.length, 2);
+  assert.deepEqual(state.approvalHistory[0], v1);
+  assert.equal(state.reviewingApproved, false);
+  await h.message('/saved 1'); assert.equal(h.last().message, v1.message);
+  await h.message('/history'); assert.equal(h.last().buttons.length, 2);
+  const restarted = new AlignmentBot({ store: h.store, telegram: h.telegram, ai: h.ai, clock: () => CLOCK });
+  await restarted.handleUpdate({ update_id: 1000, message: { chat: { id: CHAT }, text: '/saved' } });
+  assert.equal(h.last().message, state.approved.message);
+});
+
+test('explicit review migrates a legacy saved recap and waits for a change', async () => {
+  const h = harness(); await ready(h); await approveCurrent(h);
+  const loaded = await h.store.load(CHAT);
+  delete loaded.state.approvalHistory; delete loaded.state.reviewingApproved; delete loaded.state.direction;
+  await h.store.save(CHAT, loaded.state, loaded.revision);
+  await h.message('/review');
+  assert.equal((await h.state()).stage, 'reviewing_saved');
+  assert.equal((await h.state()).approvalHistory.length, 1);
+  await h.message('I approve this recap');
+  assert.equal((await h.state()).stage, 'reviewing_saved');
+  await h.message('Use the existing chair.');
+  assert.equal((await h.state()).recap.version, 2);
+});
+
+test('new files after approval preserve v1 and require inspection and a fresh v2 approval', async () => {
+  const h = harness({ files: { new: 'Use the existing chair.' } });
+  await ready(h); await approveCurrent(h);
+  const v1 = structuredClone((await h.state()).approved);
+  await h.message('', { document: { file_id: 'new', file_name: 'new-notes.txt', file_size: 24 } });
+  assert.equal((await h.state()).reviewingApproved, true);
+  await h.callback(`approve:${(await h.state()).id}:1:${v1.recap.hash}`);
+  assert.deepEqual((await h.state()).approved, v1);
+  await h.message('Files ready');
+  assert.equal(h.ai.calls.inspect.length, 1);
+  assert.equal((await h.state()).recap.version, 2);
+  assert.deepEqual((await h.state()).approved, v1);
+});
+
+test('a failed postapproval discussion preserves the snapshot and retry resumes correction', async () => {
+  const h = harness(); await ready(h); await approveCurrent(h);
+  const v1 = structuredClone((await h.state()).approved);
+  const original = h.ai.handleDiscussion.bind(h.ai);
+  h.ai.handleDiscussion = async () => { throw new Error('offline'); };
+  await h.message('Use the existing chair.');
+  assert.equal((await h.state()).stage, 'correction_pending');
+  assert.deepEqual((await h.state()).approved, v1);
+  h.ai.handleDiscussion = original; await h.message('/retry');
+  assert.equal((await h.state()).recap.version, 2);
+});
+
+test('checked source claims are shown and persist with the exact approved snapshot', async () => {
+  const h = harness(); const original = h.ai.verifyDirection.bind(h.ai);
+  h.ai.verifyDirection = async (context) => ({ ...await original(context), sources: [
+    { title: 'Building rules', url: 'https://www.example.gov/building', supports: 'Check load before setup.' },
+    { title: 'Unsafe', url: 'https://127.0.0.1/secret', supports: 'Never show.' },
+  ] });
+  await ready(h);
+  assert.match(h.telegram.sent.at(-2).message, /href="https:\/\/www.example.gov\/building"/);
+  assert.doesNotMatch(h.telegram.sent.at(-2).message, /127\.0\.0\.1/);
+  await approveCurrent(h); const saved = (await h.state()).approved;
+  assert.equal(saved.direction.sources.length, 1);
+  await h.message('/sources'); assert.match(h.last().message, /Check load before setup/);
+  await h.message('/saved'); assert.equal(h.last().message, saved.message);
+});
+
+test('Thai passport fixture carries mandatory registration before passport and Bob-owned checks', async () => {
+  const h = harness();
+  h.ai.verifyDirection = async (context) => {
+    assert.equal(context.project.name, 'Thai passport');
+    return {
+      outcome: 'Both passport applications submitted.',
+      prerequisites: [{ fact: 'Thai birth certificate required for applicants under 15.', status: 'confirmed', sourceUrls: ['https://singapore.thaiembassy.org/en/page/thai-passport-required-documents'] }],
+      sequence: ['Prepare and submit Thai birth registration.', 'Receive Thai certificates.', 'Prepare and submit passport applications.'],
+      applicationAppointment: { exists: 'yes', detail: 'Applications are required; appointment detail needs checking.', sourceUrls: [] },
+      ownership: [{ work: 'Verify appointment rules and prepare the applications.', owner: 'Builder Bob', reason: 'Public research and reversible preparation.' }, { work: 'Approve submission and attend.', owner: 'Bon', reason: 'Authorization and physical presence.' }],
+      uncertainties: [{ fact: 'House-registration requirement for first passports.', impact: 'Could change application timing.', method: 'Check official guidance and later draft inquiry if needed.', owner: 'Builder Bob' }],
+      sources: [{ title: 'Thai Embassy passport requirements', url: 'https://singapore.thaiembassy.org/en/page/thai-passport-required-documents', supports: 'Under-15 applicants require Thai birth certificates.' }], checkedAt: CLOCK,
+    };
+  };
+  h.ai.makeRecap = async ({ direction }) => ({
+    doneMeans: direction.outcome,
+    builderHelp: 'I will verify appointment rules and prepare birth registration as the required first milestone, then passport applications.',
+    bonNeeds: 'You approve submissions and attend because your authorization and presence are required; allow time once the appointment route is confirmed.',
+    firstTwoWeeks: direction.sequence.join(' Then '),
+    assumptionsDependencies: 'I will check the house-registration requirement this week. Passport timing depends on receiving the Thai certificates.',
+  });
+  h.ai.validateRecap = async (_, draft) => ({ valid: draft.firstTwoWeeks.indexOf('birth registration') < draft.firstTwoWeeks.indexOf('passport applications') && /I will verify/.test(draft.builderHelp), issues: [] });
+  await h.message('Thai passport\nTwo Singapore-born children, no Thai documents. Finish line is applications submitted.');
+  await h.message('No files');
+  const state = await h.state();
+  assert.equal(state.stage, 'recap');
+  assert.match(state.recap.builderHelp, /required first milestone/);
+  assert.doesNotMatch(state.recap.bonNeeds, /verify appointment/);
+  assert.equal(state.direction.uncertainties[0].owner, 'Builder Bob');
 });
