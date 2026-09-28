@@ -121,3 +121,27 @@ test('API failures expose only safe stage/status/code/parameter diagnostics', as
     });
   });
 });
+
+
+test('tool rejection uses one compatible lookup and retains only known authority sources', async () => {
+  const outside = 'https://unrelated.example.com/guide';
+  const returned = structuredClone(research);
+  returned.output[0].action.sources.push({ url: outside, title: 'Unrelated blog' });
+  await withResponses([structured(lookupPlan), { _httpStatus: 400, error: { type: 'invalid_request_error', param: 'tools' } }, returned,
+    structured(direction({ sources: [{ title: 'Official', url, supports: 'Required' }, { title: 'Blog', url: outside, supports: 'Unsupported' }] }))], async (requests) => {
+    const result = await verifyDirection({});
+    assert.equal(requests[1].tools[0].type, 'web_search');
+    assert.deepEqual(requests[2].tools, [{ type: 'web_search_preview' }]);
+    assert.equal(requests[2].max_tool_calls, 4);
+    assert.equal(requests[2].tool_choice, 'required');
+    assert.equal(result.lookup.tool, 'web_search_preview');
+    assert.deepEqual(result.sources.map((s) => s.url), [url]);
+  });
+});
+
+test('authentication failures do not trigger tool fallback', async () => {
+  await withResponses([structured(lookupPlan), { _httpStatus: 401, error: { code: 'invalid_api_key', param: null } }], async (requests) => {
+    await assert.rejects(verifyDirection({}), (e) => e.code.startsWith('http_401:invalid_api_key'));
+    assert.equal(requests.length, 2);
+  });
+});
