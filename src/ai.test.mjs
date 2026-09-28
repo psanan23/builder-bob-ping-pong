@@ -145,3 +145,15 @@ test('authentication failures do not trigger tool fallback', async () => {
     assert.equal(requests.length, 2);
   });
 });
+
+
+test('public authority URLs normalize to safe domain filters without weakening local/credential rejection', async () => {
+  await withResponses([structured({ ...lookupPlan, officialDomains: ['https://www.AUTHORITY.example.gov/requirements'] }), research, structured(direction())], async (requests) => {
+    const result = await verifyDirection({});
+    assert.deepEqual(requests[1].tools[0].filters.allowed_domains, ['authority.example.gov']);
+    assert.equal(result.prerequisites[0].status, 'confirmed');
+  });
+  await withResponses([structured({ ...lookupPlan, officialDomains: ['https://user:pass@authority.example.gov'] })], async () => {
+    await assert.rejects(verifyDirection({}), (e) => e.code === 'invalid_authority_domain');
+  });
+});
