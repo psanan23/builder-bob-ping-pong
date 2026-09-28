@@ -198,10 +198,11 @@ function lookupScope(plan) {
     const url = publicUrl(candidate.includes('://') ? candidate : `https://${candidate}`);
     return url ? new URL(url).hostname.toLowerCase().replace(/^www\./, '') : null;
   });
-  if (domains.some((d) => !d || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d))) {
-    throw apiFailure('invalid_authority_domain', 'The lookup authority could not be validated.', 'direction_lookup_plan');
-  }
-  return { questions, domains };
+  // The authority may be unknown or model-formatted incorrectly. Omit invalid
+  // hints and discover official evidence from the already sanitized public question.
+  // Never pass a private host, credentials or an invalid hint to the web tool.
+  return { questions, domains: domains.filter((d) => d && /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d)) };
+
 }
 
 function consultedSources(body) {
