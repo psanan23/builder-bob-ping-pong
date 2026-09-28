@@ -60,8 +60,8 @@ test('fabricated source links cannot turn a prerequisite into a checked fact', a
   });
 });
 
-test('lookup refuses identifying queries and unsafe authority domains before searching', async () => {
-  for (const patch of [{ publicQuestions: ['Check account 123456789'] }, { officialDomains: ['127.0.0.1'] }]) {
+test('lookup refuses identifying queries before searching', async () => {
+  for (const patch of [{ publicQuestions: ['Check account 123456789'] }]) {
     await withResponses([structured({ ...lookupPlan, ...patch })], async (requests) => {
       await assert.rejects(verifyDirection({}), /safer|validated/);
       assert.equal(requests.length, 1);
@@ -153,7 +153,10 @@ test('public authority URLs normalize to safe domain filters without weakening l
     assert.deepEqual(requests[1].tools[0].filters.allowed_domains, ['authority.example.gov']);
     assert.equal(result.prerequisites[0].status, 'confirmed');
   });
-  await withResponses([structured({ ...lookupPlan, officialDomains: ['https://user:pass@authority.example.gov'] })], async () => {
-    await assert.rejects(verifyDirection({}), (e) => e.code === 'invalid_authority_domain');
+  await withResponses([structured({ ...lookupPlan, officialDomains: ['https://user:pass@authority.example.gov', '127.0.0.1', 'Unknown official site'] }), research, structured(direction())], async (requests) => {
+    const result = await verifyDirection({});
+    assert.equal(requests[1].tools[0].filters, undefined);
+    assert.doesNotMatch(JSON.stringify(requests[1]), /user:pass|127\.0\.0\.1|Unknown official site/);
+    assert.equal(result.prerequisites[0].status, 'confirmed');
   });
 });
