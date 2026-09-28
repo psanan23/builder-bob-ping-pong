@@ -193,8 +193,12 @@ function lookupScope(plan) {
     /(?:https?:|@|\b\d{7,}\b|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b)/i.test(q))) {
     throw apiFailure('unsafe_lookup_scope', 'The public lookup scope needs a safer, non-identifying description.', 'direction_lookup_plan');
   }
-  const domains = (plan.officialDomains || []).slice(0, 5);
-  if (domains.some((d) => !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d) || !publicUrl(`https://${d}`))) {
+  const domains = (plan.officialDomains || []).slice(0, 5).map((value) => {
+    const candidate = String(value || '').trim();
+    const url = publicUrl(candidate.includes('://') ? candidate : `https://${candidate}`);
+    return url ? new URL(url).hostname.toLowerCase().replace(/^www\./, '') : null;
+  });
+  if (domains.some((d) => !d || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d))) {
     throw apiFailure('invalid_authority_domain', 'The lookup authority could not be validated.', 'direction_lookup_plan');
   }
   return { questions, domains };
@@ -221,7 +225,7 @@ function consultedSources(body) {
 export async function verifyDirection(context) {
   const plan = await structuredResponse({
     name: 'direction_lookup_plan', schema: PLAN_SCHEMA, maxOutputTokens: 1000,
-    instructions: `Decide whether a missing public fact could change the route, prerequisite, deadline, eligibility or required milestone. Discover prerequisites even if the person did not name them. Search only for those uncertainties, not preferences, physical measurements or judgement. Do not search when supplied current authoritative evidence already settles direction. Return at most three generalized public questions and up to five known official/primary domains; use [] when the relevant authority domain is not known, never guess a domain. The public questions must contain ONLY generic task category, relevant jurisdiction, broad eligibility category and the requirements to check. Never include person names, exact birth/travel dates, addresses, file names, identifiers, private quotations or copied file contents. needsLookup false permits empty questions.`,
+    instructions: `Decide whether a missing public fact could change the route, prerequisite, deadline, eligibility or required milestone. Discover prerequisites even if the person did not name them. Search only for those uncertainties, not preferences, physical measurements or judgement. Do not search when supplied current authoritative evidence already settles direction. Return at most three generalized public questions and up to five known official/primary domain hostnames, such as example.gov, without schemes, paths, wildcards or descriptive labels; use [] when the relevant authority domain is not known, never guess a domain. The public questions must contain ONLY generic task category, relevant jurisdiction, broad eligibility category and the requirements to check. Never include person names, exact birth/travel dates, addresses, file names, identifiers, private quotations or copied file contents. needsLookup false permits empty questions.`,
     content: [contextPart(context)],
   });
   const checkedAt = new Date().toISOString();
